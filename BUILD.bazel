@@ -83,8 +83,8 @@ cc_library(
         "@hwy//:matvec",
         "@hwy//:profiler",
         "@hwy//:thread_pool",
-        "//third_party/intel_dnnl:dnnl",
-        "//third_party/tbb",
+        "@onednn//:onednn",
+        "@onetbb//:tbb",
     ],
 )
 
@@ -173,6 +173,7 @@ cc_test(
         "@hwy//:hwy_test_util",
         "@hwy//:nanobenchmark",
         "@hwy//:thread_pool",
+        "@onednn//:onednn",
     ],
 )
 

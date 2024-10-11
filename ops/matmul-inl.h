@@ -31,9 +31,7 @@
 // After highway.h
 #include "compression/compress-inl.h"
 #include "hwy/contrib/math/math-inl.h"
-#include "third_party/intel_dnnl/include/oneapi/dnnl/dnnl.hpp"
-#include "third_party/intel_dnnl/include/oneapi/dnnl/dnnl_common.hpp"
-#include "third_party/intel_dnnl/include/oneapi/dnnl/dnnl_types.h"
+#include "dnnl.hpp"
 
 
 HWY_BEFORE_NAMESPACE();
@@ -557,12 +555,105 @@ memory convert_to_bf16(dnnl::engine engine, dnnl::stream engine_stream,
   return source_mem;
 }
 
+// Create oneDNN MatMul primitive
+template <bool kAdd, typename MatT>
+std::unique_ptr<dnnl::matmul::primitive_desc> CreateMatMulPrimDesc(
+    MatMulEnv& env, size_t kRowsA, size_t kRowsB, size_t kColsB,
+    bool blocked_weights = false, bool scale_weights = true) {
+  memory::dims src_dims = {kRowsA, kRowsB};
+  memory::dims weights_dims = {kRowsB, kColsB};
+  memory::dims bias_dims = {1, kColsB};
+  memory::dims dst_dims = {kRowsA, kColsB};
+
+  auto src_format_tag = tag::ab;
+  // `B` is a transposed matrix.
+  auto weights_format_tag = tag::ba;
+  auto dest_format_tag = tag::ab;
+
+  auto src_md = dnnl::memory::desc(src_dims, DnnType<MatT>(), src_format_tag);
+  auto weights_md = dnnl::memory::desc(
+      weights_dims, DnnType<MatT>(),
+      blocked_weights ? dnnl::memory::format_tag::any : weights_format_tag);
+  auto bias_md = dnnl::memory::desc();
+  auto dst_md = dnnl::memory::desc(dst_dims, dnnl::memory::data_type::f32,
+                                   dest_format_tag);
+
+  if (kAdd) {
+    bias_md = dnnl::memory::desc({1, kColsB}, dnnl::memory::data_type::f32,
+                                 dnnl::memory::format_tag::ab);
+  }
+  dnnl::primitive_attr attrs;
+  if (scale_weights) {
+    attrs.set_scales_mask(DNNL_ARG_WEIGHTS, 0);
+  }
+  return std::make_unique<matmul::primitive_desc>(
+      env.engine, src_md, weights_md, bias_md, dst_md, attrs);
+}
+
+// Get optimized BF16 weights, need to return a float (and not BF16) aligned
+// pointer because the compression framework does not accept BF16 inputs
+template <typename MatT, size_t kRowsA, size_t kRowsB, size_t kColsB, bool kAdd,
+          size_t kNum = kRowsB * kColsB>
+std::pair<hwy::AlignedFreeUniquePtr<float[]>, int64_t> GetBF16OptimizedWeights(
+    std::unique_ptr<CompressedArray<MatT, kNum>>& B, MatMulEnv& env,
+    hwy::ThreadPool& pool, bool blocked_weights = false) {
+  dnnl::memory::dims weights_dims = {kRowsB, kColsB};
+  auto weights_md = dnnl::memory::desc(weights_dims, DnnType<MatT>(),
+                                       dnnl::memory::format_tag::ba);
+  auto matmul_pd = CreateMatMulPrimDesc<kAdd, BF16>(env, kRowsA, kRowsB, kColsB,
+                                                    blocked_weights);
+  auto weights_mem = dnnl::memory(weights_md, env.engine, B->data());
+  auto weights_mem_opt = dnnl::memory(matmul_pd->weights_desc(), env.engine);
+  dnnl::reorder reorder_wei{weights_mem, weights_mem_opt};
+  reorder_wei.execute(env.engine_stream, weights_mem, weights_mem_opt);
+  env.engine_stream.wait();
+  auto mem_ptr = reinterpret_cast<uint16_t*>(weights_mem_opt.get_data_handle());
+  int64_t md_size = matmul_pd->weights_desc().get_size();
+  auto element_size =
+      dnnl::memory::data_type_size(matmul_pd->weights_desc().get_data_type());
+  auto num_elements = md_size / element_size;
+  hwy::AlignedFreeUniquePtr<float[]> B_opt =
+      hwy::AllocateAligned<float>(num_elements);
+  auto effective_rows = (num_elements + kColsB - 1) / kColsB;
+  pool.Run(0, effective_rows, [&](const size_t i, size_t) {
+    for (size_t j = 0; j < kColsB; j++) {
+      auto index = i * kColsB + j;
+      if (index >= num_elements) break;
+      auto elem = static_cast<uint32_t>(mem_ptr[index]) << 16;
+      std::memcpy(&B_opt[index], &elem, sizeof(elem));
+    }
+  });
+
+  return std::make_pair(std::move(B_opt), num_elements);
+}
+
+// Create a ConstMat with optimized BF16 weights
+template <typename MatT, size_t kRowsA, size_t kRowsB, size_t kColsB, bool kAdd,
+          size_t kUpperBound, size_t kNum = kRowsB * kColsB>
+Mat<const BF16> GetBF16OptimizedWeightsMatrix(
+    std::unique_ptr<CompressedArray<MatT, kNum>>& B,
+    hwy::AlignedFreeUniquePtr<float[]>& b_opt,
+    std::unique_ptr<CompressedArray<BF16, kUpperBound>>& BMat, MatMulEnv& env,
+    hwy::ThreadPool& pool, gcpp::CompressWorkingSet& ws,
+    bool blocked_weights = false) {
+  auto result = GetBF16OptimizedWeights<MatT, kRowsA, kRowsB, kColsB, kAdd>(
+      B, env, pool, blocked_weights);
+  b_opt = std::move(result.first);
+  auto num_elements = result.second;
+  CompressScaled(b_opt.get(), num_elements, ws, *BMat, pool);
+  BMat->set_scale(B->scale());
+
+  return ConstMat(BMat->data(), blocked_weights ? 1 : kRowsB);
+}
+
+// Perform oneDNN MatMul for BF16 datatype
 template <bool kAdd, typename MatTA, typename MatTB>
 HWY_NOINLINE void MatMul_dnnl(const size_t batch_size,
                               const Mat<const MatTA>& A,
                               const Mat<const MatTB>& B, const float scale,
                               const float* HWY_RESTRICT add, MatMulEnv& env,
-                              const Mat<float>& C) {
+                              const Mat<float>& C,
+                              bool blocked_weights = false) {
   dnnl::engine engine = env.engine;
   dnnl::stream engine_stream = env.engine_stream;
 
@@ -573,26 +664,22 @@ HWY_NOINLINE void MatMul_dnnl(const size_t batch_size,
   const memory::dim kRowsAC = batch_size, kColsARowsB = A.cols,
                     kColsBC = C.cols;
   memory::dims src_dims = {kRowsAC, kColsARowsB};
-  memory::dims weights_dims = {kColsARowsB, kColsBC};
-  memory::dims bias_dims = {1, kColsBC};
   memory::dims dst_dims = {kRowsAC, kColsBC};
 
   auto src_format_tag = tag::ab;
-  // `B` is a transposed matrix.
-  auto weights_format_tag = tag::ba;
   auto dest_format_tag = tag::ab;
 
-  // Create memory descriptors for inputs and outputs.
-  auto src_md = memory::desc(src_dims, DnnType<MulT>(), src_format_tag);
-  auto weights_md =
-      memory::desc(weights_dims, DnnType<MulT>(), weights_format_tag);
+  auto matmul_pd = CreateMatMulPrimDesc<kAdd, BF16>(
+      env, batch_size, kColsARowsB, kColsBC, blocked_weights);
+
   auto scale_md = memory::desc({{1}, dt::f32, tag::x});
   auto dst_md = memory::desc(dst_dims, dt::f32, dest_format_tag);
 
   auto src_mem =
       convert_to_bf16(engine, engine_stream, A, src_dims, src_format_tag);
-  auto weights_mem = convert_to_bf16(engine, engine_stream, B, weights_dims,
-                                     weights_format_tag);
+
+  auto weights_mem = memory(matmul_pd->weights_desc(), engine,
+                            const_cast<BF16*>(B.ptr + B.ofs));
   auto dst_mem = memory(dst_md, engine);
 
   // Second stage: Create the matmul primitive/operation.
@@ -606,27 +693,15 @@ HWY_NOINLINE void MatMul_dnnl(const size_t batch_size,
   // to the multiplication results before incorporating the bias.
   auto scale_mem = memory(scale_md, engine, const_cast<float*>(&scale));
   matmul_args.insert({DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, scale_mem});
-  dnnl::primitive_attr attr;
-  attr.set_scales_mask(DNNL_ARG_WEIGHTS, 0);
-
-  // Create primitive descriptor.
-  matmul::primitive_desc matmul_pd;
 
   // When there is bias, add it to the matmul_args.
   if (kAdd) {
-    auto bias_md = memory::desc(bias_dims, dt::f32, tag::ab);
-    auto bias_mem = memory(bias_md, engine);
-    bias_mem.set_data_handle(const_cast<float*>(add));
-    matmul_args.insert({DNNL_ARG_BIAS, bias_mem});
-    matmul_pd = matmul::primitive_desc(engine, src_md, weights_md, bias_md,
-                                       dst_md, attr);
-  } else {
-    matmul_pd =
-        matmul::primitive_desc(engine, src_md, weights_md, dst_md, attr);
+    matmul_args.insert({DNNL_ARG_BIAS, memory(matmul_pd->bias_desc(), engine,
+                                              const_cast<float*>(add))});
   }
 
   // Third stage: Execute the matmul primitive/operation.
-  auto matmul_prim = matmul(matmul_pd);
+  auto matmul_prim = matmul(*matmul_pd);
   matmul_prim.execute(engine_stream, matmul_args);
   engine_stream.wait();
 
@@ -645,8 +720,8 @@ template <bool kAdd, typename MatTA, typename MatTB>
 HWY_NOINLINE void MatMul(const size_t batch_size, const Mat<const MatTA>& A,
                          const Mat<const MatTB>& B, const float scale,
                          const float* HWY_RESTRICT add, MatMulEnv& env,
-                         const Mat<float>& C) {
-  MatMul_dnnl<kAdd>(batch_size, A, B, scale, add, env, C);
+                         const Mat<float>& C, bool blocked_weights = false) {
+  MatMul_dnnl<kAdd>(batch_size, A, B, scale, add, env, C, blocked_weights);
 
   // Enable the hwy matmul and disable the dnnl matmul, when we need to
   // benchmark the hwy matmul.

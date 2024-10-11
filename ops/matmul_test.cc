@@ -44,6 +44,8 @@
 #include "ops/dot-inl.h"
 #include "ops/matmul-inl.h"
 #include "hwy/tests/test_util-inl.h"
+#include "tbb/task_arena.h"
+#include "dnnl.hpp"
 
 HWY_BEFORE_NAMESPACE();
 namespace gcpp {
@@ -209,13 +211,16 @@ void PrintSpeed(const char* algo, size_t rows_ac, size_t cols_a_rows_b,
 }
 
 template <size_t kRowsAC, size_t kColsARowsB, size_t kColsBC, bool kAdd,
-          typename MatTA, typename MatTB = MatTA>
-void TestMatMul(MatMulEnv& env) {
+          typename MatTA, typename MatTB = MatTA, size_t kNum = kColsARowsB * kColsBC>
+void TestMatMul(MatMulEnv& env, bool blocked_weights = false) {
+  gcpp::CompressWorkingSet ws;
   hwy::ThreadPool& pool = env.Pool();
-  const bool want_bench = kColsBC > 2000;  // avoid spam for small matrices
-  fprintf(stderr, "TestMatMul %lu, %lu, %lu, add=%d, MatTA=%s, MatTB=%s\n",
-          kRowsAC, kColsARowsB, kColsBC, kAdd, TypeName<MatTA>(),
-          TypeName<MatTB>());
+  const bool want_bench = kColsBC > 500;  // avoid spam for small matrices
+  fprintf(stderr,
+          "TestMatMul %lu, %lu, %lu, add=%d, blocked_weights=%d, MatTA=%s, "
+          "MatTB=%s\n",
+          kRowsAC, kColsARowsB, kColsBC, kAdd, blocked_weights,
+          TypeName<MatTA>(), TypeName<MatTB>());
 
   std::unique_ptr<CompressedArray<MatTA, kRowsAC * kColsARowsB>> a =
       GenerateMat<MatTA, kRowsAC, kColsARowsB>(0, pool);
@@ -236,27 +241,43 @@ void TestMatMul(MatMulEnv& env) {
   const double start_slow = hwy::platform::Now();
   // Compare the dnnl matmul results with the hwy matmul results.
   MatMul_hwy<kAdd>(kRowsAC, ConstMat(a->data(), kColsARowsB),
-                 ConstMat(b_trans->data(), kColsARowsB), scale,
-                 kAdd ? add->data_scale1() : nullptr, env,
-                 MutableMat(c_slow->data(), kColsBC));
-  // MatMulSlow(kRowsAC, kColsARowsB, kColsBC, a->data(), b_trans->data(), scale,
-  //            kAdd ? add->data() : nullptr, c_slow->data());
+                   ConstMat(b_trans->data(), kColsARowsB), scale,
+                   kAdd ? add->data_scale1() : nullptr, env,
+                   MutableMat(c_slow->data(), kColsBC));
+  // MatMulSlow(kRowsAC, kColsARowsB, kColsBC, a->data(), b_trans->data(),
+  // scale,
+  //            kAdd ? add->data() : nullptr, env, c_slow->data());
   if (want_bench) {
-    PrintSpeed("MatMulSlow", kRowsAC, kColsARowsB, kColsBC,
+    PrintSpeed("MatMul", kRowsAC, kColsARowsB, kColsBC,
                hwy::platform::Now() - start_slow);
   }
 
+  constexpr size_t kUpperBound = ((kNum + 8191) / 8192) * 8192;
+
   double min_elapsed = hwy::HighestValue<double>();
-  for (int rep = 0; rep < (want_bench ? 3 : 1); ++rep) {
+  hwy::AlignedFreeUniquePtr<float[]> b_opt;
+  std::unique_ptr<CompressedArray<BF16, kUpperBound>> BMat =
+      std::make_unique<CompressedArray<BF16, kUpperBound>>();
+  Mat<const BF16> B_matrix;
+  if constexpr (std::is_same<MatTB, BF16>::value) {
+    B_matrix = ConstMat(b_trans->data(), kColsARowsB);
+  }
+
+  if (blocked_weights || std::is_same<MatTB, float>::value) {
+    B_matrix = GetBF16OptimizedWeightsMatrix<MatTB, kRowsAC, kColsARowsB,
+                                             kColsBC, kAdd, kUpperBound>(
+        b_trans, b_opt, BMat, env, pool, ws, blocked_weights);
+  }
+
+  for (int rep = 0; rep < (want_bench ? 50 : 1); ++rep) {
     const double start_tiled = hwy::platform::Now();
-    MatMul<kAdd>(kRowsAC, ConstMat(a->data(), kColsARowsB),
-                 ConstMat(b_trans->data(), kColsARowsB), scale,
+    MatMul<kAdd>(kRowsAC, ConstMat(a->data(), kColsARowsB), B_matrix, scale,
                  kAdd ? add->data_scale1() : nullptr, env,
-                 MutableMat(c.get(), kColsBC));
+                 MutableMat(c.get(), kColsBC), blocked_weights);
     min_elapsed = HWY_MIN(min_elapsed, hwy::platform::Now() - start_tiled);
   }
   if (want_bench) {
-    PrintSpeed("MatMul", kRowsAC, kColsARowsB, kColsBC, min_elapsed);
+    PrintSpeed("MatMul oneDNN", kRowsAC, kColsARowsB, kColsBC, min_elapsed);
   }
 
   AssertClose(kRowsAC, kColsARowsB, kColsBC, a->data(), b_trans->data(),
@@ -264,24 +285,32 @@ void TestMatMul(MatMulEnv& env) {
 }
 
 void TestAllMatMul() {
-  tbb::global_control global_limit(tbb::global_control::max_allowed_parallelism, 128);
+  tbb::global_control global_limit(tbb::global_control::max_allowed_parallelism,
+                                   128);
+  auto max_concurrency = tbb::this_task_arena::max_concurrency();
   // Skip EMU128 (10x slower than SSE4 for SFP) and older x86.
   if (HWY_TARGET != HWY_AVX3 && HWY_TARGET != HWY_AVX3_SPR) {
     return;
   }
 
-  PerClusterPools pools(/*max_clusters=*/1, /*max_threads=*/4, /*pin=*/1);
+  PerClusterPools pools(/*max_clusters=*/1, /*max_threads=*/128, /*pin=*/1);
   MatMulEnv env(pools);
   pools.StartSpinning();
 
   using F32 = float;
   using SFP = SfpStream;
 
+  TestMatMul<2, 2048, 256128, /*kAdd=*/true, F32, F32>(env, true);
+  TestMatMul<2, 2048, 256128, /*kAdd=*/false, F32, BF16>(env, true);
+  TestMatMul<2, 2048, 256128, /*kAdd=*/true, BF16, F32>(env, true);
+  TestMatMul<2, 2048, 256128, /*kAdd=*/false, BF16, BF16>(env, false);
+
   // large-scale test: batch_size=128 is better than 64 or 256 for SKX.
-  TestMatMul<128, 24576, 3072, /*kAdd=*/false, F32, BF16>(env);
-  TestMatMul<128, 3072, 24576, /*kAdd=*/false, BF16>(env);
-  TestMatMul<1, 24576, 3072, /*kAdd=*/false, BF16>(env);
-  TestMatMul<1, 3072, 24576, /*kAdd=*/false, F32, BF16>(env);
+  TestMatMul<128, 24576, 3072, /*kAdd=*/false, F32, F32>(env, false);
+  TestMatMul<128, 24576, 3072, /*kAdd=*/false, F32, BF16>(env, true);
+  TestMatMul<128, 3072, 24576, /*kAdd=*/false, BF16>(env, false);
+  TestMatMul<1, 24576, 3072, /*kAdd=*/false, BF16>(env, true);
+  TestMatMul<1, 3072, 24576, /*kAdd=*/false, F32, BF16>(env, true);
 
   // medium-sized square test - temporarily disabled for faster testing.
   if constexpr (false) {
@@ -294,8 +323,8 @@ void TestAllMatMul() {
   }
 
   // minimal non-square test. kColsARowsB must be at least 2 vectors.
-  TestMatMul<35, 128, 32, /*kAdd=*/false, F32>(env);
-  TestMatMul<34, 128, 32, /*kAdd=*/true, BF16>(env);
+  TestMatMul<35, 128, 32, /*kAdd=*/false, F32>(env, true);
+  TestMatMul<34, 128, 32, /*kAdd=*/true, BF16>(env, true);
   TestMatMul<33, 128, 32, /*kAdd=*/false, F32, BF16>(env);
   TestMatMul<33, 128, 32, /*kAdd=*/true, BF16, F32>(env);
   TestMatMul<4, 128, 32, /*kAdd=*/true, F32>(env);

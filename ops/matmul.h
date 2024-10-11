@@ -24,7 +24,7 @@
 #include "hwy/base.h"
 #include "hwy/contrib/thread_pool/thread_pool.h"
 #include "hwy/per_target.h"
-#include "third_party/intel_dnnl/include/oneapi/dnnl/dnnl.hpp"
+#include "dnnl.hpp"
 
 using namespace dnnl;
 using namespace tbb;
